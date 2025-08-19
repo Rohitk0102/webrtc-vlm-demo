@@ -114,6 +114,34 @@
           <div id="qrUrl"></div>
           <p><small>Or visit the URL directly on your phone's browser</small></p>
         </div>
+        
+        <!-- Live Metrics Panel -->
+        <div id="metricsSection" style="margin-top: 20px; padding: 16px; background: rgba(26,35,126,0.05); border-radius: 12px; border: 1px solid rgba(26,35,126,0.1);">
+          <h4 style="margin: 0 0 12px 0; color: #1a237e;">📊 Live Metrics</h4>
+          
+          <div style="margin-bottom: 12px;">
+            <div style="background: #fff; padding: 8px; border-radius: 6px; text-align: center; border: 1px solid #e0e7ef;">
+              <div style="font-size: 0.8em; color: #666;">Objects</div>
+              <div id="objectCount" style="font-weight: bold; color: #28a745;">0</div>
+            </div>
+          </div>
+          
+          <div style="margin-bottom: 12px;">
+            <button id="startBenchBtn" onclick="startBenchmark()" style="width: 100%; padding: 8px; background: #1a237e; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9em;">
+              📈 Start 30s Benchmark
+            </button>
+          </div>
+          
+          <div style="margin-bottom: 12px;">
+            <button id="downloadMetricsBtn" onclick="downloadMetrics()" style="width: 100%; padding: 8px; background: #28a745; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 0.9em;" disabled>
+              💾 Download metrics.json
+            </button>
+          </div>
+          
+          <div id="benchStatus" style="display: none; padding: 8px; background: #fff3cd; border: 1px solid #ffeaa7; border-radius: 6px; font-size: 0.9em; text-align: center;">
+            Benchmark running...
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -154,6 +182,24 @@
   let latestDetections = [];
   let senderId = null; // Store sender ID for coordination
   let pendingIceCandidates = []; // Store ICE candidates until senderId is set
+
+  // Metrics collection variables
+  let metricsData = {
+    latencies: [],
+    fps: [],
+    uplink: [],
+    downlink: [],
+    startTime: null,
+    endTime: null,
+    totalFrames: 0,
+    totalObjects: 0
+  };
+  let benchmarkActive = false;
+  let benchmarkStartTime = null;
+  let statsInterval = null;
+  let lastBytesReceived = 0;
+  let lastBytesSent = 0;
+  let lastStatsTime = Date.now();
 
   window.metricsReady = false;
 
@@ -730,6 +776,25 @@
         // store for export
         detectionsHistory.push(payload);
 
+        // ========== METRICS INTEGRATION (EXTRA CODE) ==========
+        // Collect metrics for benchmark without disturbing existing code
+        if (benchmarkActive) {
+          // Record latency
+          const latency = overlay_ts - (meta.capture_ts || overlay_ts);
+          metricsData.latencies.push(latency);
+          
+          // Record frame processed
+          metricsData.totalFrames++;
+          
+          // Record objects detected
+          metricsData.totalObjects += detections.length;
+          
+          // Calculate current FPS for this detection cycle
+          const currentFPS = 1000 / interval; // Based on detection interval
+          metricsData.fps.push(currentFPS);
+        }
+        // ========== END METRICS INTEGRATION ==========
+
         // update stats display periodically
         if (frameCount % 5 === 0) {
           updateStats();
@@ -927,6 +992,247 @@
       });
     });
   };
+
+  // ========== METRICS COLLECTION FUNCTIONS ==========
+
+  function startBenchmark() {
+    if (benchmarkActive) return;
+    
+    benchmarkActive = true;
+    benchmarkStartTime = Date.now();
+    metricsData.startTime = new Date().toISOString();
+    metricsData.latencies = [];
+    metricsData.fps = [];
+    metricsData.uplink = [];
+    metricsData.downlink = [];
+    metricsData.totalFrames = 0;
+    metricsData.totalObjects = 0;
+    
+    // Update UI
+    document.getElementById('startBenchBtn').disabled = true;
+    document.getElementById('benchStatus').style.display = 'block';
+    document.getElementById('benchStatus').innerHTML = 'Benchmark running... (30s remaining)';
+    
+    // Start collecting metrics
+    statsInterval = setInterval(collectMetrics, 1000);
+    
+    // Stop after 30 seconds
+    setTimeout(() => {
+      stopBenchmark();
+    }, 30000);
+    
+    console.log('📊 Started 30-second benchmark');
+  }
+
+  function stopBenchmark() {
+    if (!benchmarkActive) return;
+    
+    benchmarkActive = false;
+    metricsData.endTime = new Date().toISOString();
+    
+    if (statsInterval) {
+      clearInterval(statsInterval);
+      statsInterval = null;
+    }
+    
+    // Calculate final metrics
+    const finalMetrics = calculateFinalMetrics();
+    
+    // Update UI
+    document.getElementById('startBenchBtn').disabled = false;
+    document.getElementById('downloadMetricsBtn').disabled = false;
+    document.getElementById('benchStatus').style.display = 'none';
+    
+    console.log('📊 Benchmark completed:', finalMetrics);
+  }
+
+  function collectMetrics() {
+    if (!benchmarkActive) return;
+    
+    // Update benchmark status only - live metrics handled separately
+    const timeRemaining = Math.max(0, 30 - Math.floor((Date.now() - benchmarkStartTime) / 1000));
+    document.getElementById('benchStatus').innerHTML = `Benchmark running... (${timeRemaining}s remaining)`;
+  }
+
+  function calculateFinalMetrics() {
+    const sortedLatencies = [...metricsData.latencies].sort((a, b) => a - b);
+    const medianLatency = sortedLatencies.length > 0 ? 
+      sortedLatencies[Math.floor(sortedLatencies.length * 0.5)] : 0;
+    const p95Latency = sortedLatencies.length > 0 ? 
+      sortedLatencies[Math.floor(sortedLatencies.length * 0.95)] : 0;
+    
+    const avgFPS = metricsData.fps.length > 0 ? 
+      metricsData.fps.reduce((a, b) => a + b, 0) / metricsData.fps.length : 0;
+    
+    const avgUplink = metricsData.uplink.length > 0 ? 
+      metricsData.uplink.reduce((a, b) => a + b, 0) / metricsData.uplink.length : 0;
+    
+    const avgDownlink = metricsData.downlink.length > 0 ? 
+      metricsData.downlink.reduce((a, b) => a + b, 0) / metricsData.downlink.length : 0;
+    
+    return {
+      benchmark_duration_seconds: 30,
+      end_to_end_latency: {
+        median_ms: Math.round(medianLatency),
+        p95_ms: Math.round(p95Latency),
+        samples: sortedLatencies.length
+      },
+      processed_fps: {
+        average: Math.round(avgFPS),
+        samples: metricsData.fps.length
+      },
+      network_throughput: {
+        uplink_kbps: Math.round(avgUplink),
+        downlink_kbps: Math.round(avgDownlink)
+      },
+      detection_stats: {
+        total_frames_processed: metricsData.totalFrames,
+        total_objects_detected: metricsData.totalObjects
+      },
+      timestamp: {
+        start: metricsData.startTime,
+        end: metricsData.endTime
+      }
+    };
+  }
+
+  function downloadMetrics() {
+    const finalMetrics = calculateFinalMetrics();
+    
+    const blob = new Blob([JSON.stringify(finalMetrics, null, 2)], {
+      type: 'application/json'
+    });
+    
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `metrics_${new Date().toISOString().replace(/[:.]/g, '-')}.json`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    
+    console.log('📥 Downloaded metrics.json');
+  }
+
+  // Update live metrics display
+  function updateLiveMetrics() {
+    console.log('📊 Updating live metrics - Objects:', latestDetections.length);
+    
+    // Update object count (only visible metric)
+    document.getElementById('objectCount').textContent = latestDetections.length;
+    
+    // ========== COLLECT DATA FOR BENCHMARK (BACKGROUND) ==========
+    // Continue collecting all metrics for benchmark even if not displayed
+    if (benchmarkActive) {
+      // Collect latency data
+      if (e2eLatencies.length > 0) {
+        const latestLatency = e2eLatencies[e2eLatencies.length - 1];
+        metricsData.latencies.push(latestLatency);
+      }
+      
+      // Collect WebRTC stats for FPS and bandwidth
+      if (pc && (pc.connectionState === 'connected' || pc.connectionState === 'connecting')) {
+        pc.getStats().then(stats => {
+          let bytesReceived = 0;
+          let bytesSent = 0;
+          let currentFPS = 0;
+          
+          stats.forEach(report => {
+            if (report.type === 'inbound-rtp' && report.mediaType === 'video') {
+              bytesReceived = report.bytesReceived || 0;
+              currentFPS = report.framesPerSecond || 0;
+            }
+            if (report.type === 'outbound-rtp' && report.mediaType === 'video') {
+              bytesSent = report.bytesSent || 0;
+            }
+            if (report.type === 'candidate-pair' && report.state === 'succeeded') {
+              if (report.bytesReceived) bytesReceived = Math.max(bytesReceived, report.bytesReceived);
+              if (report.bytesSent) bytesSent = Math.max(bytesSent, report.bytesSent);
+            }
+          });
+          
+          const now = Date.now();
+          const timeDiff = (now - lastStatsTime) / 1000;
+          
+          if (timeDiff > 0.5) {
+            // Calculate throughput for benchmark data
+            if (bytesReceived > lastBytesReceived) {
+              const downlinkKbps = ((bytesReceived - lastBytesReceived) * 8) / (timeDiff * 1000);
+              if (downlinkKbps > 0) {
+                metricsData.downlink.push(Math.round(downlinkKbps));
+              }
+            }
+            
+            if (bytesSent > lastBytesSent) {
+              const uplinkKbps = ((bytesSent - lastBytesSent) * 8) / (timeDiff * 1000);
+              if (uplinkKbps > 0) {
+                metricsData.uplink.push(Math.round(uplinkKbps));
+              }
+            }
+            
+            lastBytesReceived = bytesReceived;
+            lastBytesSent = bytesSent;
+            lastStatsTime = now;
+          }
+          
+          // Collect FPS data
+          if (currentFPS > 0) {
+            metricsData.fps.push(currentFPS);
+          }
+          
+        }).catch(error => {
+          console.log('❌ Stats collection error:', error.message);
+        });
+      }
+      
+      // Update benchmark counters
+      metricsData.totalFrames++;
+      metricsData.totalObjects += latestDetections.length;
+    }
+    // ========== END BENCHMARK DATA COLLECTION ==========
+  }
+
+  // Start live metrics updates
+  setInterval(updateLiveMetrics, 1000);
+
+  // ========== INITIALIZE LIVE METRICS DISPLAY (SIMPLIFIED) ==========
+  // Initialize metrics display with default values
+  function initializeMetricsDisplay() {
+    document.getElementById('objectCount').textContent = '0';
+    console.log('📊 Metrics display initialized');
+  }
+  
+  // Call initialization when page loads
+  initializeMetricsDisplay();
+  
+  // Show connection status in console for debugging
+  function logConnectionStatus() {
+    if (pc) {
+      console.log('🔗 WebRTC Connection State:', pc.connectionState);
+      console.log('🧊 ICE Connection State:', pc.iceConnectionState);
+    } else {
+      console.log('❌ No WebRTC peer connection');
+    }
+  }
+  
+  // Monitor connection status less frequently
+  setInterval(logConnectionStatus, 10000);
+
+  // Initialize metrics on page load
+  initializeMetricsDisplay();
+
+  // Debug: Log metrics updates
+  setInterval(() => {
+    console.log('📊 Metrics Debug:', {
+      connectionState: pc.connectionState,
+      e2eLatenciesCount: e2eLatencies.length,
+      frameCount: frameCount,
+      latestDetections: latestDetections.length,
+      lastStatsTime: new Date(lastStatsTime).toISOString()
+    });
+  }, 5000);
+  // ========== END INITIALIZE LIVE METRICS DISPLAY ==========
 
   </script>
 </body>
