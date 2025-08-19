@@ -234,6 +234,11 @@ docker system prune -f
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
+## 📋 Technical Documentation
+
+For detailed information about system architecture, design choices, and performance optimization strategies, see:
+- **[Technical Report](TECHNICAL_REPORT.md)** - Comprehensive analysis of design choices, low-resource mode, and backpressure policies
+
 ## 🤝 Contributing
 
 1. Fork the repository
