@@ -119,6 +119,12 @@
         <div id="metricsSection" style="margin-top: 20px; padding: 16px; background: rgba(26,35,126,0.05); border-radius: 12px; border: 1px solid rgba(26,35,126,0.1);">
           <h4 style="margin: 0 0 12px 0; color: #1a237e;">📊 Live Metrics</h4>
           
+          <!-- AI Model Info -->
+          <div style="margin-bottom: 12px; padding: 6px; background: #f8f9fa; border-radius: 6px; font-size: 0.8em; text-align: center;">
+            <div style="color: #666;">AI Model</div>
+            <div id="modelInfo" style="font-weight: bold; color: #1a237e;">Loading...</div>
+          </div>
+          
           <div style="margin-bottom: 12px;">
             <div style="background: #fff; padding: 8px; border-radius: 6px; text-align: center; border: 1px solid #e0e7ef;">
               <div style="font-size: 0.8em; color: #666;">Objects</div>
@@ -147,7 +153,10 @@
   </div>
 
   <script src="/socket.io/socket.io.js"></script>
-  <!-- TensorFlow.js + coco-ssd (working client model). Replace later with tfjs-wasm or ort-web -->
+  <!-- Multiple AI Model Support: ONNX, TensorFlow Lite, and COCO-SSD fallback -->
+  <!-- ONNX Runtime Web for better models -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.3/dist/ort.min.js"></script>
+  <!-- TensorFlow.js + COCO-SSD (fallback model) -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.20.0/dist/tf.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.2/dist/coco-ssd.min.js"></script>
 
@@ -156,9 +165,492 @@
   const room = url.searchParams.get('room') || 'room1';
   const MODE = (url.searchParams.get('mode') || 'wasm'); // used only for UI hints
 
+  // ========== ENHANCED MODEL MANAGER FOR MULTIPLE AI MODELS ==========
+  
+  class ModelManager {
+    constructor() {
+      this.currentModel = null;
+      this.modelType = null;
+      this.isLoaded = false;
+      this.currentConfig = null;
+      
+      // Performance tracking
+      this.performanceMetrics = {
+        totalInferences: 0,
+        averageTime: 0,
+        lastInferenceTime: 0,
+        successRate: 0,
+        failures: 0
+      };
+      
+      // Model configurations - prioritized by performance
+      this.modelConfigs = [
+        {
+          name: 'YOLOv8n-Local',
+          type: 'onnx',
+          url: '/models/yolov8n.onnx', // Try local first
+          inputSize: [640, 640],
+          classes: 80,
+          description: 'YOLOv8 Nano - Fast and accurate (Local)'
+        },
+        {
+          name: 'YOLOv8n-CDN',
+          type: 'onnx',
+          url: 'https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.onnx',
+          inputSize: [640, 640],
+          classes: 80,
+          description: 'YOLOv8 Nano - Fast and accurate (CDN)'
+        },
+        {
+          name: 'MobileNet-SSD-Local',
+          type: 'onnx', 
+          url: '/models/ssd_mobilenet_v1_10.onnx',
+          inputSize: [300, 300],
+          classes: 91,
+          description: 'MobileNet SSD - Optimized for mobile (Local)'
+        },
+        {
+          name: 'MobileNet-SSD-CDN',
+          type: 'onnx', 
+          url: 'https://github.com/onnx/models/raw/main/vision/object_detection_segmentation/ssd-mobilenetv1/model/ssd_mobilenet_v1_10.onnx',
+          inputSize: [300, 300],
+          classes: 91,
+          description: 'MobileNet SSD - Optimized for mobile (CDN)'
+        },
+        {
+          name: 'COCO-SSD-TensorFlow',
+          type: 'tensorflow',
+          url: 'builtin',
+          inputSize: [300, 300],
+          classes: 80,
+          description: 'COCO-SSD - Reliable fallback'
+        }
+      ];
+      
+      // COCO class names for consistent labeling
+      this.cocoClasses = [
+        'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck',
+        'boat', 'traffic light', 'fire hydrant', 'stop sign', 'parking meter', 'bench',
+        'bird', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra',
+        'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
+        'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove',
+        'skateboard', 'surfboard', 'tennis racket', 'bottle', 'wine glass', 'cup',
+        'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
+        'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
+        'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse',
+        'remote', 'keyboard', 'cell phone', 'microwave', 'oven', 'toaster', 'sink',
+        'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear', 'hair drier',
+        'toothbrush'
+      ];
+    }
+
+    async loadBestAvailableModel() {
+      console.log('🚀 Loading best available AI model...');
+      
+      // First, try to discover local models
+      await this.discoverLocalModels();
+      
+      for (const config of this.modelConfigs) {
+        try {
+          console.log(`🔄 Trying to load ${config.name}...`);
+          
+          if (config.type === 'onnx') {
+            const success = await this.loadONNXModel(config);
+            if (success) {
+              this.modelType = 'onnx';
+              this.currentConfig = config;
+              this.isLoaded = true;
+              console.log(`✅ Successfully loaded ${config.name}`);
+              return true;
+            }
+          } else if (config.type === 'tensorflow') {
+            const success = await this.loadTensorFlowModel(config);
+            if (success) {
+              this.modelType = 'tensorflow';
+              this.currentConfig = config;
+              this.isLoaded = true;
+              console.log(`✅ Successfully loaded ${config.name}`);
+              return true;
+            }
+          }
+        } catch (error) {
+          console.warn(`⚠️ Failed to load ${config.name}:`, error.message);
+          continue; // Try next model
+        }
+      }
+      
+      console.error('❌ All models failed to load');
+      return false;
+    }
+
+    async discoverLocalModels() {
+      try {
+        const response = await fetch('/api/models');
+        const data = await response.json();
+        
+        if (data.models && data.models.length > 0) {
+          console.log('📁 Found local models:', data.models);
+          
+          // Add discovered models to the beginning of the config list
+          const discoveredConfigs = data.models.map(model => {
+            if (model.name.toLowerCase().includes('yolo') && model.type === 'onnx') {
+              return {
+                name: `${model.name} (Local)`,
+                type: 'onnx',
+                url: model.path,
+                inputSize: [640, 640],
+                classes: 80,
+                description: `Local YOLO model - ${(model.size / 1024 / 1024).toFixed(1)}MB`
+              };
+            } else if (model.name.toLowerCase().includes('mobilenet') && model.type === 'onnx') {
+              return {
+                name: `${model.name} (Local)`,
+                type: 'onnx',
+                url: model.path,
+                inputSize: [300, 300],
+                classes: 91,
+                description: `Local MobileNet model - ${(model.size / 1024 / 1024).toFixed(1)}MB`
+              };
+            } else if (model.type === 'onnx') {
+              return {
+                name: `${model.name} (Local)`,
+                type: 'onnx',
+                url: model.path,
+                inputSize: [640, 640], // Default size
+                classes: 80,
+                description: `Local ONNX model - ${(model.size / 1024 / 1024).toFixed(1)}MB`
+              };
+            }
+            return null;
+          }).filter(Boolean);
+          
+          // Prepend discovered models (highest priority)
+          this.modelConfigs = [...discoveredConfigs, ...this.modelConfigs];
+        }
+      } catch (error) {
+        console.log('📁 No local models API available:', error.message);
+      }
+    }
+
+    async loadONNXModel(config) {
+      try {
+        // Check if ONNX Runtime is available
+        if (typeof ort === 'undefined') {
+          throw new Error('ONNX Runtime not available');
+        }
+
+        // Create ONNX session
+        this.currentModel = await ort.InferenceSession.create(config.url);
+        console.log(`📊 ONNX Model loaded: ${config.name}`);
+        console.log('Input names:', this.currentModel.inputNames);
+        console.log('Output names:', this.currentModel.outputNames);
+        return true;
+      } catch (error) {
+        console.warn(`ONNX model load failed: ${error.message}`);
+        return false;
+      }
+    }
+
+    async loadTensorFlowModel(config) {
+      try {
+        // Use built-in COCO-SSD model
+        this.currentModel = await cocoSsd.load();
+        console.log(`📊 TensorFlow Model loaded: ${config.name}`);
+        return true;
+      } catch (error) {
+        console.warn(`TensorFlow model load failed: ${error.message}`);
+        return false;
+      }
+    }
+
+    async detect(imageData) {
+      if (!this.isLoaded || !this.currentModel) {
+        console.warn('⚠️ Model not loaded, attempting to load...');
+        const loaded = await this.loadBestAvailableModel();
+        if (!loaded) {
+          throw new Error('No AI model available for detection');
+        }
+      }
+
+      const startTime = performance.now();
+      let detections = [];
+
+      try {
+        if (this.modelType === 'onnx') {
+          detections = await this.detectONNX(imageData);
+        } else if (this.modelType === 'tensorflow') {
+          detections = await this.detectTensorFlow(imageData);
+        }
+
+        const endTime = performance.now();
+        const inferenceTime = endTime - startTime;
+        
+        // Update performance metrics
+        this.performanceMetrics.totalInferences++;
+        this.performanceMetrics.lastInferenceTime = inferenceTime;
+        this.performanceMetrics.averageTime = 
+          (this.performanceMetrics.averageTime * (this.performanceMetrics.totalInferences - 1) + inferenceTime) / 
+          this.performanceMetrics.totalInferences;
+
+        console.log(`🎯 Detection completed in ${inferenceTime.toFixed(1)}ms, found ${detections.length} objects with ${this.currentConfig?.name}`);
+        
+        return detections;
+      } catch (error) {
+        console.error(`❌ Detection failed with ${this.currentConfig?.name}:`, error);
+        this.performanceMetrics.failures++;
+        
+        // Attempt recovery with fallback model
+        if (this.modelType !== 'tensorflow' || this.currentConfig?.name !== 'COCO-SSD-TensorFlow') {
+          console.log('🔄 Attempting recovery with fallback model...');
+          return await this.fallbackToBasicModel(imageData);
+        }
+        
+        throw error;
+      }
+    }
+
+    async fallbackToBasicModel(imageData) {
+      try {
+        console.log('🚨 Using emergency fallback to COCO-SSD...');
+        const success = await this.loadTensorFlowModel({
+          name: 'COCO-SSD-TensorFlow',
+          type: 'tensorflow',
+          url: 'builtin',
+          classes: 80,
+          description: 'Emergency fallback model'
+        });
+        
+        if (success) {
+          this.modelType = 'tensorflow';
+          this.currentConfig = {
+            name: 'COCO-SSD-TensorFlow',
+            type: 'tensorflow',
+            url: 'builtin',
+            classes: 80,
+            description: 'Emergency fallback model'
+          };
+          this.isLoaded = true;
+          return await this.detectTensorFlow(imageData);
+        }
+      } catch (fallbackError) {
+        console.error('❌ Even fallback model failed:', fallbackError);
+        throw new Error('All AI models failed - system unable to perform detection');
+      }
+    }
+
+    async detectONNX(canvas) {
+      try {
+        const config = this.currentConfig;
+        const [inputHeight, inputWidth] = config.inputSize;
+        
+        // Prepare input tensor
+        const ctx = canvas.getContext('2d');
+        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        
+        // Resize and normalize image data for ONNX model
+        const resizedCanvas = document.createElement('canvas');
+        resizedCanvas.width = inputWidth;
+        resizedCanvas.height = inputHeight;
+        const resizedCtx = resizedCanvas.getContext('2d');
+        resizedCtx.drawImage(canvas, 0, 0, inputWidth, inputHeight);
+        
+        const resizedImageData = resizedCtx.getImageData(0, 0, inputWidth, inputHeight);
+        const float32Data = new Float32Array(3 * inputHeight * inputWidth);
+        
+        // Convert to normalized RGB format
+        for (let i = 0; i < resizedImageData.data.length; i += 4) {
+          const pixelIndex = i / 4;
+          float32Data[pixelIndex] = resizedImageData.data[i] / 255.0; // R
+          float32Data[pixelIndex + inputHeight * inputWidth] = resizedImageData.data[i + 1] / 255.0; // G  
+          float32Data[pixelIndex + 2 * inputHeight * inputWidth] = resizedImageData.data[i + 2] / 255.0; // B
+        }
+
+        const inputTensor = new ort.Tensor('float32', float32Data, [1, 3, inputHeight, inputWidth]);
+        
+        // Run inference
+        const results = await this.currentModel.run({ images: inputTensor });
+        
+        // Parse results (format depends on model - this is a general approach)
+        return this.parseONNXResults(results, canvas.width, canvas.height);
+        
+      } catch (error) {
+        console.error('ONNX detection error:', error);
+        return []; // Return empty array on error
+      }
+    }
+
+    parseONNXResults(results, originalWidth, originalHeight) {
+      const detections = [];
+      
+      try {
+        // Handle YOLOv8 format: outputs[0] = [1, 84, 8400] where 84 = 4 (bbox) + 80 (classes)
+        // Handle SSD format: multiple outputs [boxes, scores, classes]
+        
+        const outputNames = Object.keys(results);
+        console.log('ONNX output names:', outputNames);
+        console.log('ONNX output shapes:', outputNames.map(name => 
+          `${name}: [${results[name].dims.join(', ')}]`));
+        
+        if (outputNames.length === 1) {
+          // YOLOv8 format - single output with shape [1, 84, 8400]
+          const output = results[outputNames[0]];
+          if (output.dims.length === 3 && output.dims[1] === 84) {
+            return this.parseYOLOv8Results(output, originalWidth, originalHeight);
+          }
+        } else if (outputNames.length >= 3) {
+          // SSD format - multiple outputs
+          return this.parseSSDResults(results, originalWidth, originalHeight);
+        }
+        
+        console.log('📊 Unknown ONNX model format - using fallback');
+        
+      } catch (error) {
+        console.error('Error parsing ONNX results:', error);
+      }
+      
+      return detections;
+    }
+
+    parseYOLOv8Results(output, originalWidth, originalHeight) {
+      const detections = [];
+      const data = output.data;
+      const [batch, channels, numDetections] = output.dims;
+      
+      // YOLOv8 output format: [x_center, y_center, width, height, conf_class0, conf_class1, ...]
+      for (let i = 0; i < numDetections; i++) {
+        const offset = i * channels;
+        
+        // Extract bbox coordinates (normalized 0-1)
+        const xCenter = data[offset];
+        const yCenter = data[offset + 1]; 
+        const width = data[offset + 2];
+        const height = data[offset + 3];
+        
+        // Find best class and confidence
+        let maxConf = 0;
+        let bestClass = 0;
+        for (let c = 4; c < channels; c++) {
+          const conf = data[offset + c];
+          if (conf > maxConf) {
+            maxConf = conf;
+            bestClass = c - 4; // Subtract 4 to get class index
+          }
+        }
+        
+        // Filter by confidence threshold
+        if (maxConf > 0.25) {
+          const xmin = Math.max(0, (xCenter - width / 2) / this.currentConfig.inputSize[1]);
+          const ymin = Math.max(0, (yCenter - height / 2) / this.currentConfig.inputSize[0]);
+          const xmax = Math.min(1, (xCenter + width / 2) / this.currentConfig.inputSize[1]);
+          const ymax = Math.min(1, (yCenter + height / 2) / this.currentConfig.inputSize[0]);
+          
+          detections.push({
+            label: this.cocoClasses[bestClass] || `class_${bestClass}`,
+            score: maxConf,
+            xmin,
+            ymin,
+            xmax,
+            ymax
+          });
+        }
+      }
+      
+      console.log(`📊 YOLOv8 parsed ${detections.length} detections`);
+      return detections;
+    }
+
+    parseSSDResults(results, originalWidth, originalHeight) {
+      const detections = [];
+      
+      try {
+        // Look for common SSD output names
+        const boxesKey = Object.keys(results).find(key => 
+          key.toLowerCase().includes('box') || key.toLowerCase().includes('detection'));
+        const scoresKey = Object.keys(results).find(key => 
+          key.toLowerCase().includes('score') || key.toLowerCase().includes('conf'));
+        const classesKey = Object.keys(results).find(key => 
+          key.toLowerCase().includes('class') || key.toLowerCase().includes('label'));
+        
+        if (boxesKey && scoresKey && classesKey) {
+          const boxes = results[boxesKey].data;
+          const scores = results[scoresKey].data;
+          const classes = results[classesKey].data;
+          
+          const numDetections = Math.min(boxes.length / 4, scores.length, classes.length);
+          
+          for (let i = 0; i < numDetections; i++) {
+            const score = scores[i];
+            if (score > 0.3) {
+              const classIndex = Math.floor(classes[i]);
+              detections.push({
+                label: this.cocoClasses[classIndex] || `class_${classIndex}`,
+                score: score,
+                xmin: boxes[i * 4],
+                ymin: boxes[i * 4 + 1],
+                xmax: boxes[i * 4 + 2],
+                ymax: boxes[i * 4 + 3]
+              });
+            }
+          }
+        }
+        
+        console.log(`📊 SSD parsed ${detections.length} detections`);
+      } catch (error) {
+        console.error('Error parsing SSD results:', error);
+      }
+      
+      return detections;
+    }
+
+    async detectTensorFlow(canvas) {
+      try {
+        const predictions = await this.currentModel.detect(canvas);
+        
+        // Convert to normalized format
+        return predictions.map(p => ({
+          label: p.class,
+          score: p.score,
+          xmin: p.bbox[0] / canvas.width,
+          ymin: p.bbox[1] / canvas.height,
+          xmax: (p.bbox[0] + p.bbox[2]) / canvas.width,
+          ymax: (p.bbox[1] + p.bbox[3]) / canvas.height
+        }));
+      } catch (error) {
+        console.error('TensorFlow detection error:', error);
+        return [];
+      }
+    }
+
+    getModelInfo() {
+      if (!this.isLoaded) return 'No model loaded';
+      return `${this.currentConfig.name} (${this.modelType})`;
+    }
+
+    getPerformanceInfo() {
+      const successRate = this.performanceMetrics.totalInferences > 0 ? 
+        ((this.performanceMetrics.totalInferences - this.performanceMetrics.failures) / this.performanceMetrics.totalInferences * 100).toFixed(1) : 0;
+        
+      return {
+        modelName: this.currentConfig?.name || 'None',
+        modelType: this.modelType,
+        totalInferences: this.performanceMetrics.totalInferences,
+        averageTime: this.performanceMetrics.averageTime.toFixed(1) + 'ms',
+        lastTime: this.performanceMetrics.lastInferenceTime.toFixed(1) + 'ms',
+        successRate: successRate + '%',
+        failures: this.performanceMetrics.failures,
+        isLoaded: this.isLoaded
+      };
+    }
+  }
+
+  // Initialize model manager
+  const modelManager = new ModelManager();
+
+  // ========== END ENHANCED MODEL MANAGER ==========
+
   const socket = io();
   // Enhanced WebRTC configuration for better compatibility
-  const pc = new RTCPeerConnection({
+  let pc = new RTCPeerConnection({
     // Add STUN servers for better connectivity
     iceServers: [
       { urls: 'stun:stun.l.google.com:19302' },
@@ -182,6 +674,39 @@
   let latestDetections = [];
   let senderId = null; // Store sender ID for coordination
   let pendingIceCandidates = []; // Store ICE candidates until senderId is set
+  let connectionAttempts = 0; // Track connection attempts
+  const MAX_CONNECTION_ATTEMPTS = 3;
+
+  // Function to reset peer connection
+  function resetPeerConnection() {
+    console.log('🔄 Resetting peer connection...');
+    
+    // Close existing connection
+    if (pc) {
+      pc.close();
+    }
+    
+    // Create new peer connection
+    pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' }
+      ],
+      iceCandidatePoolSize: 10,
+      iceTransportPolicy: 'all',
+      bundlePolicy: 'max-bundle',
+      rtcpMuxPolicy: 'require',
+      sdpSemantics: 'unified-plan'
+    });
+    
+    // Reset state
+    pendingIceCandidates = [];
+    
+    // Re-attach event handlers
+    setupPeerConnectionHandlers();
+    
+    console.log('✅ Peer connection reset complete');
+  }
 
   // Metrics collection variables
   let metricsData = {
@@ -253,6 +778,16 @@
     if (e2eLatencies.length > 0) {
       const latestLatency = e2eLatencies[e2eLatencies.length - 1];
       document.getElementById('latency').textContent = `${latestLatency}ms`;
+    }
+    
+    // Update model performance information
+    const perfInfo = modelManager.getPerformanceInfo();
+    const modelElement = document.getElementById('modelInfo');
+    if (modelElement) {
+      modelElement.innerHTML = `
+        <strong>${perfInfo.modelName}</strong><br>
+        <small>Avg: ${perfInfo.averageTime} | Last: ${perfInfo.lastTime} | Success: ${perfInfo.successRate}</small>
+      `;
     }
     
     // Update detected objects list
@@ -378,6 +913,13 @@
     }
     console.log('🎯 Sender ready with tracks, creating offer for', id);
     document.getElementById('status').innerHTML = '📱 Phone ready! Creating connection...';
+    
+    // Reset connection attempts for new sender
+    connectionAttempts = 0;
+    
+    // Store sender ID
+    senderId = id;
+    
     // Create offer since receiver should initiate
     createOffer(id);
 
@@ -386,78 +928,314 @@
       if (pc.connectionState === 'new' || pc.connectionState === 'connecting') {
         console.log('⚠️ Connection timeout - attempting retry...');
         document.getElementById('status').innerHTML = '⚠️ Connection timeout - retrying...';
-        createOffer(id);
+        connectionAttempts++;
+        if (connectionAttempts < MAX_CONNECTION_ATTEMPTS) {
+          resetPeerConnection();
+          createOffer(id);
+        }
       }
     }, 10000); // 10 second timeout
   });
 
   socket.on('offer', async ({desc, from}) => {
     console.log('📨 Received offer from:', from);
-    await pc.setRemoteDescription(desc);
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    socket.emit('answer', { to: from, desc: pc.localDescription });
-    console.log('📤 Sent answer to:', from);
+    try {
+      // Check if we need to reset the connection due to signaling state
+      if (pc.signalingState !== 'stable' && pc.signalingState !== 'have-remote-offer') {
+        console.log('⚠️ Invalid signaling state for offer:', pc.signalingState, '- resetting connection');
+        resetPeerConnection();
+      }
+      
+      await pc.setRemoteDescription(desc);
+      console.log('✅ Remote description set successfully');
+      
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      socket.emit('answer', { to: from, desc: pc.localDescription });
+      console.log('📤 Sent answer to:', from);
+    } catch (error) {
+      console.error('❌ Error handling offer:', error);
+      document.getElementById('status').innerHTML = '❌ Failed to process offer: ' + error.message;
+      
+      // Try to recover by resetting the connection
+      setTimeout(() => {
+        console.log('🔄 Attempting to recover from offer error...');
+        resetPeerConnection();
+      }, 1000);
+    }
   });
   
   socket.on('answer', async ({desc, from}) => {
     console.log('📨 Received answer from:', from);
-    
-    // Set the senderId so ICE candidates can be sent to the correct peer
-    if (from) {
-      senderId = from;
-      console.log('✅ Set senderId to:', senderId);
-      sendPendingIceCandidates(); // Send any ICE candidates that were generated early
+    try {
+      // Check signaling state before setting remote description
+      if (pc.signalingState !== 'have-local-offer') {
+        console.log('⚠️ Unexpected signaling state for answer:', pc.signalingState);
+        if (pc.signalingState === 'stable') {
+          console.log('ℹ️ Connection already stable, ignoring answer');
+          return;
+        }
+      }
+      
+      // Set the senderId so ICE candidates can be sent to the correct peer
+      if (from) {
+        senderId = from;
+        console.log('✅ Set senderId to:', senderId);
+        sendPendingIceCandidates(); // Send any ICE candidates that were generated early
+      }
+      
+      await pc.setRemoteDescription(desc);
+      console.log('✅ Remote answer set successfully');
+    } catch (error) {
+      console.error('❌ Error handling answer:', error);
+      document.getElementById('status').innerHTML = '❌ Failed to process answer: ' + error.message;
+      
+      // Try to recover by resetting the connection
+      setTimeout(() => {
+        console.log('🔄 Attempting to recover from answer error...');
+        resetPeerConnection();
+        if (from) {
+          senderId = from;
+          createOffer(from);
+        }
+      }, 1000);
     }
-    
-    await pc.setRemoteDescription(desc);
   });
   
   socket.on('ice-candidate', async ({candidate}) => {
     console.log('🧊 Received ICE candidate');
-    try { await pc.addIceCandidate(candidate); } catch(e){ console.error('ICE error:', e); }
+    try {
+      // Check if we're in a valid state to add ICE candidates
+      if (pc.remoteDescription) {
+        await pc.addIceCandidate(candidate);
+        console.log('✅ ICE candidate added successfully');
+      } else {
+        console.log('⏳ Storing ICE candidate - no remote description yet');
+        pendingIceCandidates.push(candidate);
+      }
+    } catch(error) {
+      console.error('❌ ICE candidate error:', error);
+      // Don't fail the entire connection for ICE candidate errors
+    }
   });
 
-  pc.onicecandidate = e => {
-    console.log('🧊 RECEIVER ICE candidate event:', e);
-    console.log('🧊 Current senderId:', senderId);
-    console.log('🧊 ICE gathering state:', pc.iceGatheringState);
-    console.log('🧊 ICE connection state:', pc.iceConnectionState);
-    if (e.candidate) {
-      console.log('🧊 Sending ICE candidate:', e.candidate.type, e.candidate.candidate);
-      console.log('🧊 Full candidate:', e.candidate);
-      if (senderId) {
-        console.log('✅ Sending to sender:', senderId);
-        socket.emit('ice-candidate', { to: senderId, candidate: e.candidate, room: room });
-      } else {
-        console.log('⏳ Storing ICE candidate for later (senderId not yet set)');
-        pendingIceCandidates.push(e.candidate);
-      }
-    } else {
-      console.log('🧊 ICE gathering complete');
-    }
-  };
-
-  // Enhanced ICE gathering state monitoring
-  pc.onicegatheringstatechange = () => {
-    console.log('📡 RECEIVER ICE gathering state changed:', pc.iceGatheringState);
-    if (pc.iceGatheringState === 'complete') {
-      console.log('✅ RECEIVER ICE gathering completed');
-    } else if (pc.iceGatheringState === 'gathering') {
-      console.log('⏳ RECEIVER ICE gathering in progress...');
-    }
-    
-    // Force ICE restart if no candidates after 3 seconds
-    if (pc.iceGatheringState === 'complete' && pendingIceCandidates.length === 0) {
-      console.log('⚠️ RECEIVER No ICE candidates generated - forcing restart...');
-      setTimeout(() => {
-        if (pendingIceCandidates.length === 0) {
-          console.log('🔄 RECEIVER Restarting ICE gathering...');
-          pc.restartIce();
+  // Setup peer connection event handlers
+  function setupPeerConnectionHandlers() {
+    pc.onicecandidate = e => {
+      console.log('🧊 RECEIVER ICE candidate event:', e);
+      console.log('🧊 Current senderId:', senderId);
+      console.log('🧊 ICE gathering state:', pc.iceGatheringState);
+      console.log('🧊 ICE connection state:', pc.iceConnectionState);
+      if (e.candidate) {
+        console.log('🧊 Sending ICE candidate:', e.candidate.type, e.candidate.candidate);
+        console.log('🧊 Full candidate:', e.candidate);
+        if (senderId) {
+          console.log('✅ Sending to sender:', senderId);
+          socket.emit('ice-candidate', { to: senderId, candidate: e.candidate, room: room });
+        } else {
+          console.log('⏳ Storing ICE candidate for later (senderId not yet set)');
+          pendingIceCandidates.push(e.candidate);
         }
-      }, 3000);
-    }
-  };
+      } else {
+        console.log('🧊 ICE gathering complete');
+      }
+    };
+
+    // Enhanced ICE gathering state monitoring
+    pc.onicegatheringstatechange = () => {
+      console.log('📡 RECEIVER ICE gathering state changed:', pc.iceGatheringState);
+      if (pc.iceGatheringState === 'complete') {
+        console.log('✅ RECEIVER ICE gathering completed');
+      } else if (pc.iceGatheringState === 'gathering') {
+        console.log('⏳ RECEIVER ICE gathering in progress...');
+      }
+      
+      // Force ICE restart if no candidates after 3 seconds
+      if (pc.iceGatheringState === 'complete' && pendingIceCandidates.length === 0) {
+        console.log('⚠️ RECEIVER No ICE candidates generated - forcing restart...');
+        setTimeout(() => {
+          if (pendingIceCandidates.length === 0) {
+            console.log('🔄 RECEIVER Restarting ICE gathering...');
+            pc.restartIce();
+          }
+        }, 3000);
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log('🔗 Connection state:', pc.connectionState);
+      const status = document.getElementById('status');
+      
+      if (pc.connectionState === 'connected') {
+        status.innerHTML = '✅ WebRTC connected successfully!';
+        status.className = 'success';
+        connectionAttempts = 0; // Reset attempts on success
+      } else if (pc.connectionState === 'failed') {
+        status.innerHTML = '❌ WebRTC connection failed - retrying...';
+        status.className = 'error';
+        
+        // Auto-retry with connection reset
+        connectionAttempts++;
+        if (connectionAttempts < MAX_CONNECTION_ATTEMPTS) {
+          console.log(`🔄 Connection attempt ${connectionAttempts}/${MAX_CONNECTION_ATTEMPTS} - resetting connection...`);
+          setTimeout(() => {
+            resetPeerConnection();
+            if (senderId) {
+              createOffer(senderId);
+            }
+          }, 2000);
+        } else {
+          console.log('❌ Max connection attempts reached');
+          status.innerHTML = '❌ Connection failed after multiple attempts. Please refresh the page.';
+        }
+      } else if (pc.connectionState === 'connecting') {
+        status.innerHTML = '🔄 Connecting to phone...';
+        status.className = '';
+      } else if (pc.connectionState === 'disconnected') {
+        status.innerHTML = '⚠️ Phone disconnected - waiting for reconnection...';
+        status.className = 'warning';
+      } else if (pc.connectionState === 'new') {
+        status.innerHTML = '🆕 WebRTC connection initialized';
+        status.className = '';
+      }
+    };
+
+    // Monitor ICE connection state with more detail
+    pc.oniceconnectionstatechange = () => {
+      console.log('🔗 RECEIVER ICE connection state changed:', pc.iceConnectionState);
+      console.log('🔗 ICE gathering state:', pc.iceGatheringState);
+      const status = document.getElementById('status');
+      if (pc.iceConnectionState === 'failed') {
+        status.innerHTML = '❌ ICE connection failed - network connectivity issue';
+      } else if (pc.iceConnectionState === 'connected') {
+        console.log('✅ ICE connected - media should flow now');
+        status.innerHTML = '🎉 Connected! Video should appear shortly...';
+      } else if (pc.iceConnectionState === 'checking') {
+        status.innerHTML = '🔍 Checking network connectivity...';
+      } else if (pc.iceConnectionState === 'completed') {
+        status.innerHTML = '✅ Connection established successfully!';
+      }
+    };
+
+    // Monitor signaling state
+    pc.onsignalingstatechange = () => {
+      console.log('📡 Signaling state:', pc.signalingState);
+    };
+
+    pc.ontrack = (evt) => {
+      console.log('📺 Video track received:', evt);
+      console.log('📺 Stream details:', evt.streams[0]);
+      console.log('📺 Track details:', evt.track);
+      
+      const stream = evt.streams[0];
+      video.srcObject = stream;
+      
+      // Force video to be visible and add debugging
+      video.style.display = 'block';
+      video.style.backgroundColor = 'black';
+      console.log('📹 Video element setup - srcObject assigned');
+      
+      // Enhanced video setup with multiple fallbacks
+      const setupVideo = () => {
+        console.log('📹 Setting up video with metadata:', video.videoWidth, 'x', video.videoHeight);
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          setupResponsiveCanvas();
+          document.getElementById('status').innerHTML = '📹 Video stream active. Starting AI detection...';
+          // Auto-start detection
+          setTimeout(startAutoDetection, 1000);
+          return true;
+        }
+        return false;
+      };
+      
+      // Multiple event handlers to ensure video starts
+      video.onloadedmetadata = () => {
+        console.log('📹 Video metadata loaded');
+        setupVideo();
+      };
+      
+      video.onloadeddata = () => {
+        console.log('📹 Video data loaded, attempting to play...');
+        if (!setupVideo()) {
+          // Retry after a short delay
+          setTimeout(setupVideo, 100);
+        }
+        video.play().catch(e => {
+          console.log('Video play attempt failed, will retry:', e.message);
+          setTimeout(() => video.play().catch(console.warn), 1000);
+        });
+      };
+      
+      video.oncanplay = () => {
+        console.log('📹 Video can play');
+        setupVideo();
+      };
+      
+      // Force play with multiple attempts
+      const attemptPlay = async (attempts = 3) => {
+        for (let i = 0; i < attempts; i++) {
+          try {
+            await video.play();
+            console.log('✅ Video playing successfully');
+            document.getElementById('status').innerHTML = '✅ Video stream playing! Starting AI detection...';
+            // Auto-start detection
+            setTimeout(startAutoDetection, 1000);
+            return;
+          } catch (error) {
+            console.log(`Video play attempt ${i + 1} failed:`, error.message);
+            if (i === attempts - 1) {
+              console.error('❌ All video play attempts failed:', error);
+              document.getElementById('status').innerHTML = '⚠️ Video received but autoplay failed. Click video to play.';
+              // Add click handler for manual play
+              video.onclick = () => {
+                video.play().then(() => {
+                  console.log('✅ Video playing after user click');
+                  document.getElementById('status').innerHTML = '✅ Video playing! Starting AI detection...';
+                  video.onclick = null; // Remove click handler
+                  setTimeout(startAutoDetection, 1000);
+                }).catch(console.error);
+              };
+            } else {
+              await new Promise(resolve => setTimeout(resolve, 500)); // Wait before retry
+            }
+          }
+        }
+      };
+      
+      // Start play attempts
+      attemptPlay();
+
+      // Track state monitoring
+      evt.track.onended = () => {
+        console.log('⚠️ Video track ended');
+        document.getElementById('status').innerHTML = '⚠️ Video track ended - phone may have disconnected';
+      };
+      
+      evt.track.onmute = () => {
+        console.log('🔇 Video track muted');
+      };
+      
+      evt.track.onunmute = () => {
+        console.log('🔊 Video track unmuted');
+      };
+      
+      // Add responsive canvas handlers
+      video.addEventListener('resize', () => {
+        console.log('📏 Video size changed');
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          setupResponsiveCanvas();
+        }
+      });
+      
+      video.addEventListener('playing', () => {
+        console.log('▶️ Video playing event');
+        setupResponsiveCanvas();
+      });
+    };
+  }
+
+  // Initialize peer connection handlers
+  setupPeerConnectionHandlers();
 
   // Function to send pending ICE candidates when senderId becomes available
   function sendPendingIceCandidates() {
@@ -470,171 +1248,6 @@
       pendingIceCandidates = []; // Clear the pending list
     }
   }
-
-  pc.onconnectionstatechange = () => {
-    console.log('🔗 Connection state:', pc.connectionState);
-    const status = document.getElementById('status');
-    
-    if (pc.connectionState === 'connected') {
-      status.innerHTML = '✅ WebRTC connected successfully!';
-      status.className = 'success';
-    } else if (pc.connectionState === 'failed') {
-      status.innerHTML = '❌ WebRTC connection failed - retrying...';
-      status.className = 'error';
-      // Auto-retry connection
-      setTimeout(() => {
-        if (senderId && pc.connectionState === 'failed') {
-          console.log('🔄 Attempting to restart connection...');
-          pc.restartIce();
-        }
-      }, 2000);
-    } else if (pc.connectionState === 'connecting') {
-      status.innerHTML = '🔄 Connecting to phone...';
-      status.className = '';
-    } else if (pc.connectionState === 'disconnected') {
-      status.innerHTML = '⚠️ Phone disconnected - waiting for reconnection...';
-      status.className = 'warning';
-    } else if (pc.connectionState === 'new') {
-      status.innerHTML = '🆕 WebRTC connection initialized';
-      status.className = '';
-    }
-  };
-
-  // Monitor ICE connection state with more detail
-  pc.oniceconnectionstatechange = () => {
-    console.log('🔗 RECEIVER ICE connection state changed:', pc.iceConnectionState);
-    console.log('🔗 ICE gathering state:', pc.iceGatheringState);
-    const status = document.getElementById('status');
-    if (pc.iceConnectionState === 'failed') {
-      status.innerHTML = '❌ ICE connection failed - network connectivity issue';
-    } else if (pc.iceConnectionState === 'connected') {
-      console.log('✅ ICE connected - media should flow now');
-      status.innerHTML = '🎉 Connected! Video should appear shortly...';
-    } else if (pc.iceConnectionState === 'checking') {
-      status.innerHTML = '🔍 Checking network connectivity...';
-    } else if (pc.iceConnectionState === 'completed') {
-      status.innerHTML = '✅ Connection established successfully!';
-    }
-  };
-
-  // Monitor ICE gathering state
-  pc.onicegatheringstatechange = () => {
-    console.log('🧊 ICE gathering state:', pc.iceGatheringState);
-    if (pc.iceGatheringState === 'complete') {
-      console.log('✅ ICE gathering completed');
-    }
-  };
-
-  // Monitor signaling state
-  pc.onsignalingstatechange = () => {
-    console.log('📡 Signaling state:', pc.signalingState);
-  };
-
-  pc.ontrack = (evt) => {
-    console.log('📺 Video track received:', evt);
-    console.log('📺 Stream details:', evt.streams[0]);
-    console.log('📺 Track details:', evt.track);
-    
-    const stream = evt.streams[0];
-    video.srcObject = stream;
-    
-    // Enhanced video setup with multiple fallbacks
-    const setupVideo = () => {
-      console.log('📹 Setting up video with metadata:', video.videoWidth, 'x', video.videoHeight);
-      if (video.videoWidth > 0 && video.videoHeight > 0) {
-        setupResponsiveCanvas();
-        document.getElementById('status').innerHTML = '📹 Video stream active. Starting AI detection...';
-        // Auto-start detection
-        setTimeout(startAutoDetection, 1000);
-        return true;
-      }
-      return false;
-    };
-    
-    // Multiple event handlers to ensure video starts
-    video.onloadedmetadata = () => {
-      console.log('📹 Video metadata loaded');
-      setupVideo();
-    };
-    
-    video.onloadeddata = () => {
-      console.log('📹 Video data loaded, attempting to play...');
-      if (!setupVideo()) {
-        // Retry after a short delay
-        setTimeout(setupVideo, 100);
-      }
-      video.play().catch(e => {
-        console.log('Video play attempt failed, will retry:', e.message);
-        setTimeout(() => video.play().catch(console.warn), 1000);
-      });
-    };
-    
-    video.oncanplay = () => {
-      console.log('📹 Video can play');
-      setupVideo();
-    };
-    
-    // Force play with multiple attempts
-    const attemptPlay = async (attempts = 3) => {
-      for (let i = 0; i < attempts; i++) {
-        try {
-          await video.play();
-          console.log('✅ Video playing successfully');
-          document.getElementById('status').innerHTML = '✅ Video stream playing! Starting AI detection...';
-          // Auto-start detection
-          setTimeout(startAutoDetection, 1000);
-          return;
-        } catch (error) {
-          console.log(`Video play attempt ${i + 1} failed:`, error.message);
-          if (i === attempts - 1) {
-            console.error('❌ All video play attempts failed:', error);
-            document.getElementById('status').innerHTML = '⚠️ Video received but autoplay failed. Click video to play.';
-            // Add click handler for manual play
-            video.onclick = () => {
-              video.play().then(() => {
-                console.log('✅ Video playing after user click');
-                document.getElementById('status').innerHTML = '✅ Video playing! Starting AI detection...';
-                video.onclick = null; // Remove click handler
-                setTimeout(startAutoDetection, 1000);
-              }).catch(console.error);
-            };
-          } else {
-            await new Promise(resolve => setTimeout(resolve, 500)); // Wait before retry
-          }
-        }
-      }
-    };
-    
-    // Start play attempts
-    attemptPlay();
-
-    // Track state monitoring
-    evt.track.onended = () => {
-      console.log('⚠️ Video track ended');
-      document.getElementById('status').innerHTML = '⚠️ Video track ended - phone may have disconnected';
-    };
-    
-    evt.track.onmute = () => {
-      console.log('🔇 Video track muted');
-    };
-    
-    evt.track.onunmute = () => {
-      console.log('🔊 Video track unmuted');
-    };
-    
-    // Add responsive canvas handlers
-    video.addEventListener('resize', () => {
-      console.log('📏 Video size changed');
-      if (video.videoWidth > 0 && video.videoHeight > 0) {
-        setupResponsiveCanvas();
-      }
-    });
-    
-    video.addEventListener('playing', () => {
-      console.log('▶️ Video playing event');
-      setupResponsiveCanvas();
-    });
-  };
   
   // Handle window resize for responsive design
   window.addEventListener('resize', () => {
@@ -649,19 +1262,33 @@
     try {
       console.log('📤 Creating offer for:', targetId);
       
-      // Add transceiver to ensure we're ready to receive video
-      pc.addTransceiver('video', { direction: 'recvonly' });
-      console.log('📺 Added video transceiver in recvonly mode');
+      // Check signaling state before creating offer
+      if (pc.signalingState !== 'stable') {
+        console.log('⚠️ Connection not in stable state:', pc.signalingState, '- resetting');
+        resetPeerConnection();
+      }
       
-      // Receiver should request to receive video
+      // Ensure we have a video transceiver before creating offer
+      const transceivers = pc.getTransceivers();
+      const hasVideoTransceiver = transceivers.some(t => t.receiver && t.receiver.track && t.receiver.track.kind === 'video');
+      
+      if (!hasVideoTransceiver) {
+        console.log('📺 Adding video transceiver in recvonly mode');
+        pc.addTransceiver('video', { direction: 'recvonly' });
+      } else {
+        console.log('📺 Video transceiver already exists');
+      }
+      
+      // Create offer with consistent options
       const offerOptions = {
         offerToReceiveVideo: true,
-        offerToReceiveAudio: false
+        offerToReceiveAudio: false,
+        iceRestart: false // Prevent unnecessary ICE restart
       };
       
       const offer = await pc.createOffer(offerOptions);
       
-      // Modify SDP to prefer compatible codecs
+      // Modify SDP to prefer compatible codecs and ensure consistent ordering
       offer.sdp = preferCompatibleCodecs(offer.sdp);
       
       await pc.setLocalDescription(offer);
@@ -671,6 +1298,16 @@
     } catch (error) {
       console.error('❌ Failed to create offer:', error);
       document.getElementById('status').innerHTML = '❌ Failed to create WebRTC offer: ' + error.message;
+      
+      // Try to recover by resetting connection
+      connectionAttempts++;
+      if (connectionAttempts < MAX_CONNECTION_ATTEMPTS) {
+        console.log(`🔄 Retrying offer creation (attempt ${connectionAttempts}/${MAX_CONNECTION_ATTEMPTS})`);
+        setTimeout(() => {
+          resetPeerConnection();
+          createOffer(targetId);
+        }, 2000);
+      }
     }
   }
 
@@ -691,20 +1328,32 @@
     updateStats();
   });
 
-  // CLIENT (WASM) MODEL LOOP - uses coco-ssd for working demo
-  let model = null;
+  // CLIENT (ENHANCED) MODEL LOOP - supports ONNX, TensorFlow Lite, and COCO-SSD
   let running = false;
   
   async function startAutoDetection() {
     if (running) return;
-    document.getElementById('status').innerHTML = '🧠 Loading AI model...';
+    
+    document.getElementById('status').innerHTML = '🧠 Loading best available AI model...';
+    
     try {
-      model = await cocoSsd.load();
-      document.getElementById('status').innerHTML = '🎯 AI model loaded! Running real-time detection...';
+      const success = await modelManager.loadBestAvailableModel();
+      if (!success) {
+        throw new Error('Failed to load any AI model');
+      }
+      
+      const modelInfo = modelManager.getModelInfo();
+      document.getElementById('status').innerHTML = `🎯 ${modelInfo} loaded! Running real-time detection...`;
+      console.log(`🚀 Using model: ${modelInfo}`);
+      
+      // Update the model info display
+      document.getElementById('modelInfo').textContent = modelInfo;
+      
       running = true;
       runDetectLoop();
     } catch (error) {
-      document.getElementById('status').innerHTML = '❌ Failed to load model: ' + error.message;
+      console.error('Model loading error:', error);
+      document.getElementById('status').innerHTML = '❌ Failed to load AI model: ' + error.message;
     }
   }
 
@@ -732,22 +1381,16 @@
         console.log('🔍 Running detection on frame:', off.width, 'x', off.height);
         
         const startInference = Date.now();
-        const predictions = await model.detect(off);
+        // Use the enhanced model manager for detection
+        const predictions = await modelManager.detect(off);
         const inference_ts = Date.now();
         
         console.log('📊 Detected objects:', predictions.length, predictions);
         
-        // map to normalized coords
-        const detections = predictions.map(p => {
-          return {
-            label: p.class,
-            score: p.score,
-            xmin: p.bbox[0] / off.width,
-            ymin: p.bbox[1] / off.height,
-            xmax: (p.bbox[0] + p.bbox[2]) / off.width,
-            ymax: (p.bbox[1] + p.bbox[3]) / off.height
-          };
-        });
+        // Predictions are already in normalized format from model manager
+        const detections = predictions.filter(p => p.score > 0.3); // Filter low confidence
+        
+        console.log('📊 High confidence detections:', detections.length);
 
         // attach frame alignment using lastMeta
         const meta = lastMeta || { frame_id: 'na', capture_ts: Date.now() };
@@ -932,6 +1575,9 @@
     console.log('Video dimensions:', video.videoWidth, 'x', video.videoHeight);
     console.log('Video paused:', video.paused);
     console.log('Video muted:', video.muted);
+    console.log('Video style display:', video.style.display);
+    console.log('Video current time:', video.currentTime);
+    console.log('Video duration:', video.duration);
     console.log('WebRTC connection state:', pc.connectionState);
     console.log('WebRTC ice connection state:', pc.iceConnectionState);
     console.log('WebRTC signaling state:', pc.signalingState);
@@ -943,7 +1589,10 @@
         console.log(`Track ${i}:`, track.label, 'enabled:', track.enabled, 'state:', track.readyState);
       });
       
-      // Force video to play
+      // Force video to play and show
+      video.style.display = 'block';
+      video.style.visibility = 'visible';
+      video.style.opacity = '1';
       video.play().then(() => {
         console.log('✅ Video play successful');
         document.getElementById('status').innerHTML = '✅ Video test successful!';

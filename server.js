@@ -66,6 +66,55 @@ function getNetworkIP() {
 
 app.use(express.static('public'));
 
+// Serve AI models from models directory with proper headers
+app.use('/models', express.static('models', {
+  setHeaders: (res, path) => {
+    // Set appropriate headers for different model formats
+    if (path.endsWith('.onnx')) {
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Cache-Control', 'public, max-age=86400'); // Cache for 1 day
+    } else if (path.endsWith('.tflite')) {
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+    } else if (path.endsWith('.bin') || path.endsWith('.json')) {
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+    }
+  }
+}));
+
+// API endpoint to list available models
+app.get('/api/models', (req, res) => {
+  try {
+    const modelsDir = './models';
+    if (!fs.existsSync(modelsDir)) {
+      return res.json({ models: [], message: 'Models directory not found' });
+    }
+    
+    const files = fs.readdirSync(modelsDir);
+    const modelFiles = files.filter(file => 
+      file.endsWith('.onnx') || 
+      file.endsWith('.tflite') || 
+      file.endsWith('.bin')
+    );
+    
+    const models = modelFiles.map(file => {
+      const stats = fs.statSync(`${modelsDir}/${file}`);
+      return {
+        name: file,
+        path: `/models/${file}`,
+        size: stats.size,
+        modified: stats.mtime,
+        type: file.split('.').pop()
+      };
+    });
+    
+    res.json({ models, count: models.length });
+  } catch (error) {
+    res.status(500).json({ error: 'Failed to list models', details: error.message });
+  }
+});
+
 // Object detection API endpoint
 app.post('/api/detect', express.json({limit: '10mb'}), async (req, res) => {
   try {
